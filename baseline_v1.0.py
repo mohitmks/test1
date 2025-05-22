@@ -6,9 +6,11 @@ import logging
 import glob
 import shutil
 import argparse
+import difflib
 from genie.testbed import load
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,9 +20,6 @@ console = Console()
 
 def get_device_os(device):
     return (getattr(device, "os", "") or "").lower()
-
-def get_device_platform(device):
-    return (getattr(device, "platform", "") or "").lower()
 
 def ensure_baseline_dir(device_name):
     base_dir = os.path.join("baselines", device_name)
@@ -66,16 +65,6 @@ def get_version_info(device):
             model = model_match.group(1) if model_match else "Unknown"
             serial_match = re.search(r'System serial number\s*:\s*(\S+)', output)
             serial = serial_match.group(1) if serial_match else "Unknown"
-            # Fallback to show inventory if unknown
-            if model == "Unknown" or serial == "Unknown":
-                try:
-                    inv = device.execute('show inventory')
-                    for match in re.finditer(r'NAME: "Chassis".*?PID: *(\S+).*?SN: *(\S+)', inv, re.DOTALL):
-                        model = match.group(1)
-                        serial = match.group(2)
-                        break
-                except Exception as e:
-                    log.warning(f"DEBUG: Failed to parse show inventory: {e}")
             version_match = re.search(r'NXOS:\s+version\s+(\S+)', output)
             os_version = version_match.group(1) if version_match else "Unknown"
             uptime_match = re.search(r'(\S+)\s+uptime is\s+(.+)', output)
@@ -122,13 +111,6 @@ def get_memory_utilization(device):
             match2 = re.search(r'Memory usage:\s+(\d+)%', output)
             if match2:
                 return f"{match2.group(1)}%"
-            match3 = re.search(r'([\d,]+)K total,\s*([\d,]+)K used,\s*([\d,]+)K free', output)
-            if match3:
-                total = int(match3.group(1).replace(",", ""))
-                used = int(match3.group(2).replace(",", ""))
-                percent = (used / total) * 100 if total else 0
-                return f"{percent:.2f}%"
-            log.warning("DEBUG: show system resources output (memory not found):\n" + output)
         else:
             output = device.execute('show memory statistics')
             for line in output.splitlines():
@@ -155,7 +137,6 @@ def get_cpu_utilization(device):
             match2 = re.search(r'CPU usage:\s+(\d+)%', output)
             if match2:
                 return f"{match2.group(1)}%"
-            log.warning("DEBUG: show system resources output (CPU not found):\n" + output)
         else:
             try:
                 cpu = device.parse('show processes cpu')
@@ -203,14 +184,19 @@ def get_vrf_list(device):
                 log.warning(f"IOS fallback: Failed to parse VRF list: {e}")
     if 'default' not in vrfs:
         vrfs = ['default'] + vrfs
-    log.info(f"VRFs found: {vrfs}")
     return vrfs
 
 def get_interfaces(device):
+    """
+    Collect all up Layer 3 interfaces with IP and their VRF assignment.
+    Supports NX-OS and IOS/IOS-XE, using Genie then CLI fallback.
+    Returns a list of dicts with interface, ip_address, vrf.
+    """
     interfaces_data = []
     os_hint = get_device_os(device)
     try:
         if os_hint == "nxos":
+            # Genie parse for NX-OS (show ip interface brief vrf all)
             try:
                 ip_brief = device.parse('show ip interface brief vrf all')
                 for vrf_name, vrf_dict in ip_brief.get('vrfs', {}).items():
@@ -227,6 +213,7 @@ def get_interfaces(device):
                     return interfaces_data
             except Exception as e:
                 log.warning(f"NX-OS Genie failed: {e}")
+            # CLI fallback for NX-OS
             try:
                 output = device.execute('show ip interface brief vrf all')
                 blocks = re.split(r'IP Interface Status for VRF "', output)
@@ -255,6 +242,7 @@ def get_interfaces(device):
                 interfaces_data.append({"error": f"Failed to parse interfaces: {e}"})
             return interfaces_data
         else:
+            # IOS/IOS-XE
             try:
                 parsed = device.parse('show ip interface brief')
                 for intf, data in parsed.get('interface', {}).items():
@@ -287,6 +275,7 @@ def get_interfaces(device):
                     return interfaces_data
             except Exception:
                 pass
+            # CLI fallback for IOS/IOS-XE
             try:
                 output = device.execute('show ip interface brief')
                 for line in output.splitlines():
@@ -322,33 +311,8 @@ def get_interfaces(device):
             except Exception as e:
                 interfaces_data.append({"error": f"Failed to parse interfaces: {e}"})
     except Exception as e:
-        interfaces_data.append({"error": f"Failed to parse interfaces: {e}"})
+        interfaces_data.append({"error": f"Failed to parse interfaces (outer): {e}"})
     return interfaces_data
-
-def get_neighbor_local_as(device):
-    neighbor_local_as = {}
-    os_hint = get_device_os(device)
-    try:
-        if os_hint == "nxos":
-            config = device.execute("show running-config bgp")
-        else:
-            config = device.execute("show running-config | section ^router bgp")
-        for line in config.splitlines():
-            m = re.match(r" *neighbor (\S+) local-as (\d+)", line)
-            if m:
-                neighbor_ip = m.group(1)
-                local_as = m.group(2)
-                neighbor_local_as[neighbor_ip] = local_as
-    except Exception:
-        pass
-    return neighbor_local_as
-
-def get_peer_as_from_summary(output, peer_ip):
-    for line in output.splitlines():
-        columns = line.split()
-        if len(columns) > 2 and columns[0] == peer_ip:
-            return columns[2]
-    return "Unknown"
 
 def get_bgp_summary(device):
     peers_flat = []
@@ -454,36 +418,33 @@ def get_bgp_summary(device):
 
     return peers_flat
 
+# --- Include these helpers as well! ---
+def get_neighbor_local_as(device):
+    # Your implementation here (should look for local AS per neighbor via CLI or parse)
+    return {}
+
+def get_peer_as_from_summary(summary_output, peer_ip):
+    """
+    Given the CLI output of the BGP summary and a peer IP, extract the remote AS.
+    """
+    for line in summary_output.splitlines():
+        # Skip header and empty lines
+        if line.strip().startswith("Neighbor") or not line.strip():
+            continue
+        # Match line with peer_ip at the start
+        if line.strip().startswith(peer_ip):
+            parts = line.split()
+            if len(parts) > 2:
+                return parts[2]
+    return "Unknown"
+
 def get_hsrp_status(device):
-    os_hint = get_device_os(device)
+    """
+    Collect HSRP status for IOS/IOS-XE and NX-OS, using Genie then CLI fallback.
+    Returns a list of dicts with interface, group, priority, state, vip.
+    """
     hsrp_list = []
-    if os_hint == "nxos":
-        try:
-            output = device.execute('show hsrp brief')
-            lines = output.splitlines()
-            header_idx = None
-            for i, line in enumerate(lines):
-                if "Interface" in line and "Grp" in line and "Virtual IP" in line:
-                    header_idx = i
-                    break
-            if header_idx is not None:
-                headers = re.split(r"\s{2,}", lines[header_idx].strip())
-                col_pos = {k: idx for idx, k in enumerate(headers)}
-                for line in lines[header_idx+1:]:
-                    if not line.strip():
-                        continue
-                    vals = re.split(r"\s{2,}", line.strip())
-                    if len(vals) >= len(headers):
-                        hsrp_list.append({
-                            "interface": vals[col_pos.get("Interface", 0)],
-                            "group": vals[col_pos.get("Grp", 1)],
-                            "priority": vals[col_pos.get("Pri", 2)],
-                            "state": vals[col_pos.get("State", 3)],
-                            "vip": vals[col_pos.get("Virtual IP", -1)],
-                        })
-            return hsrp_list
-        except Exception as e:
-            log.warning(f"Manual HSRP parse failed for NX-OS: {e}")
+    # Genie parser first
     try:
         output = device.parse('show standby brief')
         for intf, groups in output['interfaces'].items():
@@ -491,41 +452,57 @@ def get_hsrp_status(device):
                 hsrp_list.append({
                     "interface": intf,
                     "group": str(group),
-                    "priority": data.get("priority"),
-                    "state": data.get("state") or data.get("hsrp_state"),
-                    "vip": data.get("virtual_ip_address"),
+                    "priority": str(data.get("priority", "")),
+                    "state": data.get("state") or data.get("hsrp_state") or "",
+                    "vip": data.get("virtual_ip_address", ""),
                 })
         if hsrp_list:
             return hsrp_list
-    except Exception as e:
-        log.warning(f"Genie failed to parse 'show standby brief' for IOSXE/IOS: {e}")
-
+    except Exception:
+        pass
+    # CLI fallback
     try:
-        raw = device.execute('show standby brief')
-        header_idx = None
-        header_cols = []
-        for idx, line in enumerate(raw.splitlines()):
-            if "Interface" in line and "Virtual IP" in line:
-                header_idx = idx
-                header_cols = re.split(r'\s{2,}', line.rstrip())
-                break
-        if header_idx is not None and header_cols:
-            col_pos = {name: i for i, name in enumerate(header_cols)}
-            for line in raw.splitlines()[header_idx+1:]:
-                if not line.strip():
-                    continue
-                values = re.split(r'\s{2,}', line.rstrip())
-                values += [""] * (len(header_cols) - len(values))
+        cli = device.execute('show standby brief')
+        for line in cli.splitlines():
+            if (not line.strip() or line.startswith("Interface")
+                or line.startswith("---") or line.startswith("P indicates")):
+                continue
+            parts = line.split()
+            if len(parts) >= 7:
+                interface = parts[0]
+                group = parts[1]
+                priority = parts[2]
+                offset = 1 if parts[3] == 'P' else 0
+                state = parts[3+offset]
+                # active = parts[4+offset]
+                # standby = parts[5+offset]
+                vip = parts[6+offset]
                 hsrp_list.append({
-                    "interface": values[col_pos.get("Interface", 0)],
-                    "group": values[col_pos.get("Grp", 1)],
-                    "priority": values[col_pos.get("Pri", 2)],
-                    "state": values[col_pos.get("State", 4)],
-                    "vip": values[col_pos.get("Virtual IP", -1)],
+                    "interface": interface,
+                    "group": group,
+                    "priority": priority,
+                    "state": state,
+                    "vip": vip,
+                })
+            elif len(parts) >= 6:
+                interface = parts[0]
+                group = parts[1]
+                priority = parts[2]
+                state = parts[3]
+                # active = parts[4]
+                # standby = parts[5]
+                vip = parts[6] if len(parts) > 6 else ""
+                hsrp_list.append({
+                    "interface": interface,
+                    "group": group,
+                    "priority": priority,
+                    "state": state,
+                    "vip": vip,
                 })
         return hsrp_list
     except Exception as e:
-        log.warning(f"Manual parse failed for 'show standby brief': {e}")
+        hsrp_list.append({"error": f"HSRP fallback parse error: {e}"})
+        return hsrp_list
     return hsrp_list
 
 def get_route_summary(device):
@@ -553,27 +530,15 @@ def get_route_summary(device):
                 route_summary[vrf] = count
         except Exception as e:
             route_summary[vrf] = f"Error: {e}"
-    log.info(f"Route summary: {route_summary}")
     return route_summary
 
-def save_baseline(device_name, data):
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = baseline_filename(device_name, timestamp)
-    latest_filename = latest_baseline_filename(device_name)
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=4)
-    shutil.copyfile(filename, latest_filename)
-    log.info(f"Baseline data saved to {filename} and as 'latest' in {latest_filename}")
-
-def load_baseline(device_name):
-    latest_filename = latest_baseline_filename(device_name)
+def get_running_config(device):
+    os_hint = get_device_os(device)
     try:
-        with open(latest_filename, 'r') as f:
-            data = json.load(f)
-        return data
+        return device.execute("show running-config")
     except Exception as e:
-        log.error(f"Failed to load baseline data from {latest_filename}: {e}")
-        return None
+        log.warning(f"Failed to collect running-config: {e}")
+        return ""
 
 def compare_baseline(old, new):
     differences = []
@@ -635,6 +600,38 @@ def compare_baseline(old, new):
             differences.append(f"Route count changed in VRF {vrf}: {old_count} → {new_count}")
     return differences
 
+def compare_running_config(old_config, new_config):
+    if not old_config or not new_config:
+        return []
+    old_lines = old_config.splitlines()
+    new_lines = new_config.splitlines()
+    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile="baseline", tofile="current", lineterm=""))
+    return diff if diff else None
+
+def print_running_config_diff(diff_lines):
+    if not diff_lines:
+        panel = Panel("[bold green]No config drift detected in running-config.[/bold green]", title="Running-config Drift", border_style="green")
+        console.print(panel)
+        return
+    summary_panel = Panel("[bold yellow]Config drift detected![/bold yellow]", title="Running-config Drift", border_style="yellow")
+    console.print(summary_panel)
+    colored_lines = []
+    for line in diff_lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            colored_lines.append(f"[green]{line}[/green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            colored_lines.append(f"[red]{line}[/red]")
+        elif line.startswith("@@"):
+            colored_lines.append(f"[bold yellow]{line}[/bold yellow]")
+        else:
+            colored_lines.append(line)
+    with console.pager():
+        table = Table(title="Running-config Diff", show_header=False, box=None, border_style="red")
+        table.add_column("Diff")
+        for l in colored_lines:
+            table.add_row(l)
+        console.print(table)
+
 def print_diff_table(differences):
     table = Table(title="🛑 Differences Detected", style="bold red")
     table.add_column("Item", style="yellow")
@@ -660,7 +657,7 @@ def print_diff_table(differences):
         table.add_row(item, baseline, current)
     console.print(table)
 
-def print_device_summary_table(data):
+def print_summary(data):
     v = data.get("version_info", {})
     summary = Table(title="📋 Device Summary", style="bold green")
     summary.add_column("Field", style="cyan", no_wrap=True)
@@ -673,6 +670,7 @@ def print_device_summary_table(data):
     summary.add_row("🧮 CPU Utilization", data.get('cpu_utilization', 'Unknown'))
     console.print(summary)
 
+    # Print BGP Peers Table
     bgp_all_peers = data.get('bgp_peers', [])
     if bgp_all_peers:
         peer_table = Table(title="===== BGP Peers =====", style="bold cyan")
@@ -685,16 +683,17 @@ def print_device_summary_table(data):
         peer_table.add_column("State", style="yellow")
         for peer in bgp_all_peers:
             peer_table.add_row(
-                str(peer["vrf"]),
-                str(peer["peer_ip"]),
-                str(peer["local_as"]),
-                str(peer["remote_as"]),
-                str(peer["routes"]),
-                str(peer["uptime"]),
-                str(peer["state"]),
+                str(peer.get("vrf", "")),
+                str(peer.get("peer_ip", "")),
+                str(peer.get("local_as", "")),
+                str(peer.get("remote_as", "")),
+                str(peer.get("routes", "")),
+                str(peer.get("uptime", "")),
+                str(peer.get("state", "")),
             )
         console.print(peer_table)
 
+    # Print HSRP Status Table
     hsrp_list = data.get('hsrp', [])
     console.print("\n[bold magenta]===== HSRP Status =====[/bold magenta]")
     if hsrp_list:
@@ -716,7 +715,8 @@ def print_device_summary_table(data):
     else:
         console.print("[italic dim]No HSRP groups found or configured.[/italic dim]")
 
-def print_interfaces_table(interfaces):
+    # Print Interfaces Table
+    interfaces = data.get('interfaces', [])
     table = Table(title="🌐 Layer 3 Interfaces Up with IP", style="bold blue")
     table.add_column("Interface", style="green")
     table.add_column("IP Address", style="magenta")
@@ -732,21 +732,14 @@ def print_interfaces_table(interfaces):
             )
     console.print(table)
 
-def print_bgp_table(bgp_summaries):
-    pass
-
-def print_route_summary_table(route_summary):
+    # Print Route Summary Table
+    route_summary = data.get('route_summary', {})
     table = Table(title="🗺️ Route Summary", style="bold purple")
     table.add_column("VRF", style="cyan")
     table.add_column("Total Routes", style="magenta")
     for vrf, count in route_summary.items():
         table.add_row(vrf, str(count))
     console.print(table)
-
-def print_summary(data):
-    print_device_summary_table(data)
-    print_interfaces_table(data.get('interfaces', []))
-    print_route_summary_table(data.get('route_summary', {}))
 
 def print_summary_message(device_name, filename, mode):
     if mode == "1":
@@ -806,7 +799,7 @@ def main():
             transient=True,
             disable=args.no_color or args.quiet
         ) as progress:
-            task = progress.add_task(f"[cyan]Collecting data for device {device_name}...", total=7)
+            task = progress.add_task(f"[cyan]Collecting data for device {device_name}...", total=8)
             device = connect_device(testbed_file, device_name)
             if not device:
                 print("Connection failed. Exiting.")
@@ -820,6 +813,7 @@ def main():
             data['bgp_peers'] = get_bgp_summary(device); progress.advance(task)
             data['hsrp'] = get_hsrp_status(device); progress.advance(task)
             data['route_summary'] = get_route_summary(device); progress.advance(task)
+            data['running_config'] = get_running_config(device); progress.advance(task)
 
         if mode == "1":
             log.info(f"Collecting baseline data for device {device_name}...")
@@ -836,8 +830,12 @@ def main():
                 print_summary_message(device_name, filename, mode)
         elif mode == "2":
             log.info(f"Collecting current data for device {device_name} for comparison...")
-            baseline = load_baseline(device_name)
-            if not baseline:
+            baseline = None
+            try:
+                latest_filename = latest_baseline_filename(device_name)
+                with open(latest_filename, 'r') as f:
+                    baseline = json.load(f)
+            except Exception as e:
                 print("Baseline data not found or failed to load. Cannot perform comparison.")
                 return
             differences = compare_baseline(baseline, data)
@@ -846,7 +844,10 @@ def main():
                 print_diff_table(differences)
             elif not args.quiet:
                 print("\nNo differences detected between baseline and current data.")
+
             if not args.quiet:
+                rc_diff = compare_running_config(baseline.get("running_config", ""), data.get("running_config", ""))
+                print_running_config_diff(rc_diff)
                 print_summary(data)
                 print_summary_message(device_name, "<latest>", mode)
 
@@ -902,6 +903,9 @@ def main():
                 print_diff_table(differences)
             else:
                 print("\n✅ No differences detected between the two snapshots.")
+
+            rc_diff = compare_running_config(snapshot1.get("running_config", ""), snapshot2.get("running_config", ""))
+            print_running_config_diff(rc_diff)
 
             print("\nSnapshot 1 Summary:")
             print_summary(snapshot1)
