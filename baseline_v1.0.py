@@ -8,6 +8,7 @@ import shutil
 import argparse
 import difflib
 from genie.testbed import load
+from rich.text import Text
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -17,6 +18,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 console = Console()
+
+def filter_config_lines(config_lines):
+    """
+    Returns a new list of config lines, excluding timestamp, command, and other noisy lines.
+    """
+    filtered = []
+    skip_patterns = [
+        re.compile(r'^!Command: show running-config'),           # command banner
+        re.compile(r'^!Running configuration last done at:'),    # last done timestamp
+        re.compile(r'^!Time:'),                                  # time line
+        re.compile(r'^!'),                                       # any line that's just '!'
+        # Add your own patterns as needed
+    ]
+    for line in config_lines:
+        if any(pat.match(line.strip()) for pat in skip_patterns):
+            continue
+        filtered.append(line)
+    return filtered
 
 def get_device_os(device):
     return (getattr(device, "os", "") or "").lower()
@@ -59,12 +78,31 @@ def get_version_info(device):
         output = device.execute('show version')
         model = serial = "Unknown"
         if os_hint == "nxos":
-            model_match = re.search(r'^cisco\s+(\S+)\s+Chassis', output, re.MULTILINE)
+            # Try several patterns for model
+            model_match = re.search(r'^\s*Model\s*number\s*[:=]\s*(\S+)', output, re.MULTILINE)
             if not model_match:
-                model_match = re.search(r'Model number\s*:\s*(\S+)', output)
+                model_match = re.search(r'^cisco\s+(\S+)\s+Chassis', output, re.MULTILINE)
+            if not model_match:
+                model_match = re.search(r'Model:\s*(\S+)', output)
             model = model_match.group(1) if model_match else "Unknown"
-            serial_match = re.search(r'System serial number\s*:\s*(\S+)', output)
+
+            # Try several patterns for serial
+            serial_match = re.search(r'(?:System )?serial number\s*[:=]\s*(\S+)', output, re.IGNORECASE)
+            if not serial_match:
+                serial_match = re.search(r'Processor board ID (\S+)', output)
             serial = serial_match.group(1) if serial_match else "Unknown"
+
+            # Fallback to show inventory if unknown
+            if model == "Unknown" or serial == "Unknown":
+                try:
+                    inv = device.execute('show inventory')
+                    for match in re.finditer(r'NAME: "Chassis".*?PID: *(\S+).*?SN: *(\S+)', inv, re.DOTALL | re.IGNORECASE):
+                        model = match.group(1)
+                        serial = match.group(2)
+                        break
+                except Exception as e:
+                    log.warning(f"DEBUG: Failed to parse show inventory: {e}")
+
             version_match = re.search(r'NXOS:\s+version\s+(\S+)', output)
             os_version = version_match.group(1) if version_match else "Unknown"
             uptime_match = re.search(r'(\S+)\s+uptime is\s+(.+)', output)
@@ -242,74 +280,46 @@ def get_interfaces(device):
                 interfaces_data.append({"error": f"Failed to parse interfaces: {e}"})
             return interfaces_data
         else:
-            # IOS/IOS-XE
+            # IOS/IOS-XE: Use 'show ip vrf interfaces' for proper VRF mapping
             try:
-                parsed = device.parse('show ip interface brief')
-                for intf, data in parsed.get('interface', {}).items():
-                    ip_addr = data.get('ip_address', '')
-                    status = data.get('status', '').lower()
-                    if ip_addr and ip_addr.lower() != 'unassigned' and "up" in status:
-                        interfaces_data.append({
-                            "interface": intf,
-                            "ip_address": ip_addr,
-                            "vrf": "default"
-                        })
-                vrfs = get_vrf_list(device)
-                for vrf in vrfs:
-                    if vrf == "default":
-                        continue
+                try:
+                    vrf_intf_output = device.execute('show ip vrf interfaces')
+                except Exception:
+                    vrf_intf_output = device.execute('show ip vrf int')  # alternate form
+
+                for line in vrf_intf_output.splitlines():
+                    # Match: Interface   IP-Address      VRF         Protocol
+                    m = re.match(r'^(\S+)\s+([\d.]+)?\s+(\S+)\s+(\S+)', line)
+                    if m:
+                        intf = m.group(1)
+                        ip = m.group(2) or ""
+                        vrf = m.group(3)
+                        proto = m.group(4)
+                        if proto.lower() == "up" and ip and ip.lower() != "unassigned":
+                            interfaces_data.append({
+                                "interface": intf,
+                                "ip_address": ip,
+                                "vrf": vrf
+                            })
+                # If above fails (empty), fallback to Genie parse
+                if not interfaces_data:
                     try:
-                        parsed_vrf = device.parse(f"show ip interface brief vrf {vrf}")
-                        for intf, data in parsed_vrf.get('interface', {}).items():
+                        parsed = device.parse('show ip interface brief')
+                        for intf, data in parsed.get('interface', {}).items():
                             ip_addr = data.get('ip_address', '')
                             status = data.get('status', '').lower()
                             if ip_addr and ip_addr.lower() != 'unassigned' and "up" in status:
                                 interfaces_data.append({
                                     "interface": intf,
                                     "ip_address": ip_addr,
-                                    "vrf": vrf
-                                })
-                    except Exception:
-                        pass
-                if interfaces_data:
-                    return interfaces_data
-            except Exception:
-                pass
-            # CLI fallback for IOS/IOS-XE
-            try:
-                output = device.execute('show ip interface brief')
-                for line in output.splitlines():
-                    if re.match(r'^\S', line) and not line.startswith('Interface'):
-                        parts = line.split()
-                        if len(parts) >= 6:
-                            intf, ip_addr, _, _, status, proto = parts[:6]
-                            if ip_addr.lower() not in ['unassigned', 'unknown', 'none'] and "up" in status.lower():
-                                interfaces_data.append({
-                                    "interface": intf,
-                                    "ip_address": ip_addr,
                                     "vrf": "default"
                                 })
-                vrfs = get_vrf_list(device)
-                for vrf in vrfs:
-                    if vrf == "default":
-                        continue
-                    try:
-                        output = device.execute(f"show ip interface brief vrf {vrf}")
-                        for line in output.splitlines():
-                            if re.match(r'^\S', line) and not line.startswith('Interface'):
-                                parts = line.split()
-                                if len(parts) >= 6:
-                                    intf, ip_addr, _, _, status, proto = parts[:6]
-                                    if ip_addr.lower() not in ['unassigned', 'unknown', 'none'] and "up" in status.lower():
-                                        interfaces_data.append({
-                                            "interface": intf,
-                                            "ip_address": ip_addr,
-                                            "vrf": vrf
-                                        })
                     except Exception:
                         pass
+                return interfaces_data
             except Exception as e:
                 interfaces_data.append({"error": f"Failed to parse interfaces: {e}"})
+        return interfaces_data
     except Exception as e:
         interfaces_data.append({"error": f"Failed to parse interfaces (outer): {e}"})
     return interfaces_data
@@ -600,37 +610,60 @@ def compare_baseline(old, new):
             differences.append(f"Route count changed in VRF {vrf}: {old_count} → {new_count}")
     return differences
 
-def compare_running_config(old_config, new_config):
+def compare_running_config(old_config, new_config, context_lines=2):
     if not old_config or not new_config:
         return []
-    old_lines = old_config.splitlines()
-    new_lines = new_config.splitlines()
-    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile="baseline", tofile="current", lineterm=""))
+    old_filtered = filter_config_lines(old_config)
+    new_filtered = filter_config_lines(new_config)
+    old_lines = old_filtered.splitlines()
+    new_lines = new_filtered.splitlines()
+    diff = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile="baseline",
+            tofile="current",
+            lineterm="",
+            n=context_lines
+        )
+    )
     return diff if diff else None
 
 def print_running_config_diff(diff_lines):
     if not diff_lines:
-        panel = Panel("[bold green]No config drift detected in running-config.[/bold green]", title="Running-config Drift", border_style="green")
+        panel = Panel(
+            "[bold green]No config drift detected in running-config.[/bold green]",
+            title="Running-config Drift",
+            border_style="green",
+        )
         console.print(panel)
         return
-    summary_panel = Panel("[bold yellow]Config drift detected![/bold yellow]", title="Running-config Drift", border_style="yellow")
-    console.print(summary_panel)
-    colored_lines = []
+
+    diff_text = Text()
+    max_len = 0
     for line in diff_lines:
+        # Count printable length (no color codes)
+        plain_line = line
+        max_len = max(max_len, len(plain_line))
         if line.startswith("+") and not line.startswith("+++"):
-            colored_lines.append(f"[green]{line}[/green]")
+            diff_text.append(line + "\n", style="green")
         elif line.startswith("-") and not line.startswith("---"):
-            colored_lines.append(f"[red]{line}[/red]")
+            diff_text.append(line + "\n", style="red")
         elif line.startswith("@@"):
-            colored_lines.append(f"[bold yellow]{line}[/bold yellow]")
+            diff_text.append(line + "\n", style="yellow")
         else:
-            colored_lines.append(line)
-    with console.pager():
-        table = Table(title="Running-config Diff", show_header=False, box=None, border_style="red")
-        table.add_column("Diff")
-        for l in colored_lines:
-            table.add_row(l)
-        console.print(table)
+            diff_text.append(line + "\n")
+
+    # Add a small margin for panel borders and padding
+    panel_width = max_len + 4
+
+    panel = Panel(
+        diff_text,
+        title="Running-config Drift",
+        border_style="yellow",
+        width=panel_width,  # Set dynamically to content
+    )
+    console.print(panel)
 
 def print_diff_table(differences):
     table = Table(title="🛑 Differences Detected", style="bold red")
@@ -655,6 +688,33 @@ def print_diff_table(differences):
             baseline = ""
             current = ""
         table.add_row(item, baseline, current)
+    console.print(table)
+# ... all your existing imports and code remain unchanged ...
+
+def print_hsrp_summary(hsrp_list):
+    """
+    Pretty-prints an HSRP group summary table.
+    If no HSRP groups are present, shows a friendly message in the table.
+    """
+    table = Table(title="===== HSRP Status =====", show_header=True, header_style="bold magenta")
+    table.add_column("Interface", style="cyan")
+    table.add_column("Group", style="blue")
+    table.add_column("Priority", style="magenta")
+    table.add_column("State", style="green")
+    table.add_column("VIP", style="yellow")
+
+    # No HSRP groups or only empty entries
+    if not hsrp_list or all(not h.get("interface") for h in hsrp_list):
+        table.add_row("No HSRP groups found or configured.", "", "", "", "")
+    else:
+        for h in hsrp_list:
+            table.add_row(
+                str(h.get("interface", "")),
+                str(h.get("group", "")),
+                str(h.get("priority", "")),
+                str(h.get("state", "")),
+                str(h.get("vip", "")),
+            )
     console.print(table)
 
 def print_summary(data):
@@ -693,27 +753,9 @@ def print_summary(data):
             )
         console.print(peer_table)
 
-    # Print HSRP Status Table
+    # Print HSRP Status Table (uses new, robust function)
     hsrp_list = data.get('hsrp', [])
-    console.print("\n[bold magenta]===== HSRP Status =====[/bold magenta]")
-    if hsrp_list:
-        hsrp_table = Table(show_header=True, header_style="bold magenta")
-        hsrp_table.add_column("Interface", style="cyan")
-        hsrp_table.add_column("Group", style="blue")
-        hsrp_table.add_column("Priority", style="magenta")
-        hsrp_table.add_column("State", style="green")
-        hsrp_table.add_column("VIP", style="yellow")
-        for h in hsrp_list:
-            hsrp_table.add_row(
-                str(h.get("interface", "")),
-                str(h.get("group", "")),
-                str(h.get("priority", "")),
-                str(h.get("state", "")),
-                str(h.get("vip", "")),
-            )
-        console.print(hsrp_table)
-    else:
-        console.print("[italic dim]No HSRP groups found or configured.[/italic dim]")
+    print_hsrp_summary(hsrp_list)
 
     # Print Interfaces Table
     interfaces = data.get('interfaces', [])
@@ -741,6 +783,7 @@ def print_summary(data):
         table.add_row(vrf, str(count))
     console.print(table)
 
+# ... rest of your script remains unchanged ...
 def print_summary_message(device_name, filename, mode):
     if mode == "1":
         console.print(f"\n[bold green]✅ Baseline collection complete![/bold green]")
